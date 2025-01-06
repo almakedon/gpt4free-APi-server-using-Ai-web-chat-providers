@@ -1,3 +1,68 @@
+### G4F - Installation Guide
+
+Follow these steps to install G4F from the source code:
+
+1. Clone the GitHub repository:
+
+```
+git clone https://github.com/almakedon/gpt4free-usingweb
+```
+
+2. Navigate to the project directory:
+
+```
+cd gpt4free-usingweb
+```
+
+3. (Recommended) Create a Python virtual environment:
+You can follow the [Python official documentation](https://docs.python.org/3/tutorial/venv.html) for virtual environments.
+
+
+```
+python -m venv venv
+```
+
+4. Activate the virtual environment:
+   - On Windows:
+   ```
+   cd venv/Scripts
+   activate
+   cd..
+   cd.. 
+   ```
+   - On macOS and Linux:
+   ```
+   source venv/bin/activate
+   ```
+5. Install the required Python packages from `requirements.txt`:
+
+```
+pip install -r requirements.txt
+```
+Running Serve API:
+
+```
+g4f api
+
+```
+if its running you will see this:
+``` 
+INFO:     Started server process [29668]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:1337 (Press CTRL+C to quit)
+```
+
+6. Create a `test.py` file in the root folder and start using the repo, further Instructions are below
+
+```py
+import g4f
+
+...
+```
+
+
+
 
 # G4F - Git Installation Guide
 
