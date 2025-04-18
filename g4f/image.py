@@ -3,13 +3,10 @@ from __future__ import annotations
 import os
 import re
 import io
-import time
-import uuid
 import base64
-import asyncio
+from urllib.parse import quote_plus
 from io import BytesIO
 from pathlib import Path
-from aiohttp import ClientSession, ClientError
 try:
     from PIL.Image import open as open_image, new as new_image
     from PIL.Image import FLIP_LEFT_RIGHT, ROTATE_180, ROTATE_270, ROTATE_90
@@ -19,9 +16,7 @@ except ImportError:
 
 from .typing import ImageType, Union, Image, Optional, Cookies
 from .errors import MissingRequirementsError
-from .providers.response import ImageResponse, ImagePreview
 from .requests.aiohttp import get_connector
-from . import debug
 
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'webp', 'svg'}
 
@@ -234,44 +229,6 @@ def to_data_uri(image: ImageType) -> str:
         data_base64 = base64.b64encode(data).decode()
         return f"data:{is_accepted_format(data)};base64,{data_base64}"
     return image
-
-# Function to ensure the images directory exists
-def ensure_images_dir():
-    os.makedirs(images_dir, exist_ok=True)
-
-async def copy_images(
-    images: list[str],
-    cookies: Optional[Cookies] = None,
-    proxy: Optional[str] = None
-) -> list[str]:
-    ensure_images_dir()
-    async with ClientSession(
-        connector=get_connector(proxy=proxy),
-        cookies=cookies
-    ) as session:
-        async def copy_image(image: str) -> str:
-            target = os.path.join(images_dir, f"{int(time.time())}_{str(uuid.uuid4())}")
-            if image.startswith("data:"):
-                with open(target, "wb") as f:
-                    f.write(extract_data_uri(image))
-            else:
-                try:
-                    async with session.get(image) as response:
-                        response.raise_for_status()
-                        with open(target, "wb") as f:
-                            async for chunk in response.content.iter_chunked(4096):
-                                f.write(chunk)
-                except ClientError as e:
-                    debug.log(f"copy_images failed: {e.__class__.__name__}: {e}")
-                    return image
-            with open(target, "rb") as f:
-                extension = is_accepted_format(f.read(12)).split("/")[-1]
-                extension = "jpg" if extension == "jpeg" else extension
-            new_target = f"{target}.{extension}"
-            os.rename(target, new_target)
-            return f"/images/{os.path.basename(new_target)}"
-
-        return await asyncio.gather(*[copy_image(image) for image in images])
 
 class ImageDataResponse():
     def __init__(

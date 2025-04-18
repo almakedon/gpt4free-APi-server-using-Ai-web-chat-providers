@@ -3,12 +3,14 @@ from __future__ import annotations
 import base64
 import json
 import requests
+from typing import Optional
 from aiohttp import ClientSession, BaseConnector
 
-from ...typing import AsyncResult, Messages, ImagesType
-from ...image import to_bytes, is_accepted_format
+from ...typing import AsyncResult, Messages, MediaListType
+from ...image import to_bytes, is_data_an_media
 from ...errors import MissingAuthError
 from ...requests.raise_for_status import raise_for_status
+from ...providers.response import Usage, FinishReason
 from ..base_provider import AsyncGeneratorProvider, ProviderModelMixin
 from ..helper import get_connector
 from ... import debug
@@ -21,6 +23,7 @@ class GeminiPro(AsyncGeneratorProvider, ProviderModelMixin):
 
     working = True
     supports_message_history = True
+    supports_system_message = True
     needs_auth = True
 
     default_model = "gemini-1.5-pro"
@@ -37,7 +40,8 @@ class GeminiPro(AsyncGeneratorProvider, ProviderModelMixin):
     def get_models(cls, api_key: str = None, api_base: str = api_base) -> list[str]:
         if not cls.models:
             try:
-                response = requests.get(f"{api_base}/models?key={api_key}")
+                url = f"{cls.api_base if not api_base else api_base}/models"
+                response = requests.get(url, params={"key": api_key})
                 raise_for_status(response)
                 data = response.json()
                 cls.models = [
@@ -47,8 +51,10 @@ class GeminiPro(AsyncGeneratorProvider, ProviderModelMixin):
                 ]
                 cls.models.sort()
             except Exception as e:
-                debug.log(e)
-                cls.models = cls.fallback_models
+                debug.error(e)
+                if api_key is not None:
+                    raise MissingAuthError("Invalid API key")
+                return cls.fallback_models
         return cls.models
 
     @classmethod
@@ -61,7 +67,8 @@ class GeminiPro(AsyncGeneratorProvider, ProviderModelMixin):
         api_key: str = None,
         api_base: str = api_base,
         use_auth_header: bool = False,
-        images: ImagesType = None,
+        media: MediaListType = None,
+        tools: Optional[list] = None,
         connector: BaseConnector = None,
         **kwargs
     ) -> AsyncResult:
@@ -87,13 +94,13 @@ class GeminiPro(AsyncGeneratorProvider, ProviderModelMixin):
                 for message in messages
                 if message["role"] != "system"
             ]
-            if images is not None:
-                for image, _ in images:
+            if media is not None:
+                for media_data, filename in media:
                     image = to_bytes(image)
                     contents[-1]["parts"].append({
                         "inline_data": {
-                            "mime_type": is_accepted_format(image),
-                            "data": base64.b64encode(image).decode()
+                            "mime_type": is_data_an_media(image, filename),
+                            "data": base64.b64encode(media_data).decode()
                         }
                     })
             data = {
@@ -104,7 +111,20 @@ class GeminiPro(AsyncGeneratorProvider, ProviderModelMixin):
                     "maxOutputTokens": kwargs.get("max_tokens"),
                     "topP": kwargs.get("top_p"),
                     "topK": kwargs.get("top_k"),
-                }
+                },
+                 "tools": [{
+                    "function_declarations": [{
+                        "name": tool["function"]["name"],
+                        "description": tool["function"]["description"],
+                        "parameters": {
+                            "type": "object",
+                            "properties": {key: {
+                                "type": value["type"],
+                                "description": value["title"]
+                            } for key, value in tool["function"]["parameters"]["properties"].items()}
+                        },
+                    } for tool in tools]
+                }] if tools else None
             }
             system_prompt = "\n".join(
                 message["content"]
@@ -128,6 +148,15 @@ class GeminiPro(AsyncGeneratorProvider, ProviderModelMixin):
                                 data = b"".join(lines)
                                 data = json.loads(data)
                                 yield data["candidates"][0]["content"]["parts"][0]["text"]
+                                if "finishReason" in data["candidates"][0]:
+                                    yield FinishReason(data["candidates"][0]["finishReason"].lower())
+                                usage = data.get("usageMetadata")
+                                if usage:
+                                    yield Usage(
+                                        prompt_tokens=usage.get("promptTokenCount"),
+                                        completion_tokens=usage.get("candidatesTokenCount"),
+                                        total_tokens=usage.get("totalTokenCount")
+                                    )
                             except:
                                 data = data.decode(errors="ignore") if isinstance(data, bytes) else data
                                 raise RuntimeError(f"Read chunk failed: {data}")

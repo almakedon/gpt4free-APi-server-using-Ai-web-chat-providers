@@ -8,11 +8,11 @@
    - [From Repository](#from-repository)
    - [Using the Interference API](#using-the-interference-api)
    - [Basic Usage](#basic-usage)
-   - [With OpenAI Library](#with-openai-library)
+   - [Using the OpenAI Library](#using-the-openai-library)
    - [With Requests Library](#with-requests-library)
+   - [Selecting a Provider](#selecting-a-provider)
    - [Key Points](#key-points)
    - [Conclusion](#conclusion)
-  
 
 ## Introduction
 The G4F Interference API is a powerful tool that allows you to serve other OpenAI integrations using G4F (Gpt4free). It acts as a proxy, translating requests intended for the OpenAI API into requests compatible with G4F providers. This guide will walk you through the process of setting up, running, and using the Interference API effectively.
@@ -95,35 +95,45 @@ curl -X POST "http://localhost:1337/v1/images/generate" \
          }'
 ```
 
+---
 
-### With OpenAI Library
+### Using the OpenAI Library
 
-**You can use the Interference API with the OpenAI Python library by changing the `base_url`:**
+**To utilize the Inference API with the OpenAI Python library, you can specify the `base_url` to point to your endpoint:**
+
 ```python
 from openai import OpenAI
 
+# Initialize the OpenAI client
 client = OpenAI(
-    api_key="",
-    base_url="http://localhost:1337/v1"
+    api_key="secret",  # Set an API key (use "secret" if your provider doesn't require one)
+    base_url="http://localhost:1337/v1"  # Point to your local or custom API endpoint
 )
 
+# Create a chat completion request
 response = client.chat.completions.create(
-    model="gpt-4o-mini",
-    messages=[{"role": "user", "content": "Write a poem about a tree"}],
-    stream=True,
+    model="gpt-4o-mini",  # Specify the model to use
+    messages=[{"role": "user", "content": "Write a poem about a tree"}],  # Define the input message
+    stream=True,  # Enable streaming for real-time responses
 )
 
+# Handle the response
 if isinstance(response, dict):
-    # Not streaming
+    # Non-streaming response
     print(response.choices[0].message.content)
 else:
-    # Streaming
+    # Streaming response
     for token in response:
         content = token.choices[0].delta.content
         if content is not None:
             print(content, end="", flush=True)
-
 ```
+
+**Notes:**
+- The `api_key` is required by the OpenAI Python library. If your provider does not require an API key, you can set it to `"secret"`. This value will be ignored by providers in G4F.
+- Replace `"http://localhost:1337/v1"` with the appropriate URL for your custom or local inference API.
+
+---
   
 
 ### With Requests Library
@@ -148,6 +158,12 @@ for choice in json_response:
     print(choice.get('message', {}).get('content', ''))
 
 ```
+
+## Selecting a Provider
+
+**Provider Selection**: [How to Specify a Provider?](selecting_a_provider.md)
+
+Selecting the right provider is a key step in configuring the G4F Interference API to suit your needs. Refer to the guide linked above for detailed instructions on choosing and specifying a provider.
 
 ## Key Points
    - The Interference API translates OpenAI API requests into G4F provider requests.

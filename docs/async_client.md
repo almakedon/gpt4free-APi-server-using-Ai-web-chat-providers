@@ -1,4 +1,6 @@
 
+
+
 # G4F - AsyncClient API Guide
 The G4F AsyncClient API is a powerful asynchronous interface for interacting with various AI models. This guide provides comprehensive information on how to use the API effectively, including setup, usage examples, best practices, and important considerations for optimal performance.
 
@@ -17,7 +19,12 @@ The G4F AsyncClient API is designed to be compatible with the OpenAI API, making
    - [Text Completions](#text-completions)
    - [Streaming Completions](#streaming-completions)
    - [Using a Vision Model](#using-a-vision-model)
+   - **[Transcribing Audio with Chat Completions](#transcribing-audio-with-chat-completions)** *(New Section)*
    - [Image Generation](#image-generation)
+   - **[Video Generation](#video-generation)** *(New Section)*
+   - [Advanced Usage](#advanced-usage)
+   - [Conversation Memory](#conversation-memory)
+   - [Search Tool Support](#search-tool-support)
    - [Concurrent Tasks](#concurrent-tasks-with-asynciogather)
    - [Available Models and Providers](#available-models-and-providers)
    - [Error Handling and Best Practices](#error-handling-and-best-practices)
@@ -145,7 +152,7 @@ from g4f.client import AsyncClient
 async def main():
     client = AsyncClient()
 
-    stream = client.chat.completions.create(
+    stream = client.chat.completions.stream(
         model="gpt-4",
         messages=[
             {
@@ -153,15 +160,17 @@ async def main():
                 "content": "Say this is a test"
             }
         ],
-        stream=True,
+        web_search = False
     )
-    
+
     async for chunk in stream:
         if chunk.choices and chunk.choices[0].delta.content:
             print(chunk.choices[0].delta.content, end="")
 
 asyncio.run(main())
 ```
+
+---
 
 ### Using a Vision Model
 **Analyze an image and generate a description:**
@@ -195,6 +204,54 @@ async def main():
 
 asyncio.run(main())
 ```
+
+---
+
+### Transcribing Audio with Chat Completions
+
+Some providers in G4F support audio inputs in chat completions, allowing you to transcribe audio files by instructing the model accordingly. This example demonstrates how to use the `AsyncClient` to transcribe an audio file asynchronously:
+
+```python
+import asyncio
+from g4f.client import AsyncClient
+import g4f.Provider
+import g4f.models
+
+async def main():
+    client = AsyncClient(provider=g4f.Provider.PollinationsAI)  # or g4f.Provider.Microsoft_Phi_4
+
+    with open("audio.wav", "rb") as audio_file:
+        response = await client.chat.completions.create(
+            model=g4f.models.default,
+            messages=[{"role": "user", "content": "Transcribe this audio"}],
+            media=[[audio_file, "audio.wav"]],
+            modalities=["text"],
+        )
+
+    print(response.choices[0].message.content)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+#### Explanation
+- **Client Initialization**: An `AsyncClient` instance is created with a provider that supports audio inputs, such as `PollinationsAI` or `Microsoft_Phi_4`.
+- **File Handling**: The audio file (`audio.wav`) is opened in binary read mode (`"rb"`) using a context manager (`with` statement) to ensure proper file closure after use.
+- **API Call**: The `chat.completions.create` method is called with:
+  - `model=g4f.models.default`: Uses the default model for the selected provider.
+  - `messages`: A list containing a user message instructing the model to transcribe the audio.
+  - `media`: A list of lists, where each inner list contains the file object and its name (`[[audio_file, "audio.wav"]]`).
+  - `modalities=["text"]`: Specifies that the output should be text (the transcription).
+- **Response**: The transcription is extracted from `response.choices[0].message.content` and printed.
+
+#### Notes
+- **Provider Support**: Ensure the chosen provider (e.g., `PollinationsAI` or `Microsoft_Phi_4`) supports audio inputs in chat completions. Not all providers may offer this functionality.
+- **File Path**: Replace `"audio.wav"` with the path to your own audio file. The file format (e.g., WAV) should be compatible with the provider.
+- **Model Selection**: If `g4f.models.default` does not support audio transcription, you may need to specify a model that does (consult the provider's documentation for supported models).
+
+This example complements the guide by showcasing how to handle audio inputs asynchronously, expanding on the multimodal capabilities of the G4F AsyncClient API.
+
+---
 
 ### Image Generation
 **The `response_format` parameter is optional and can have the following values:**
@@ -244,6 +301,234 @@ async def main():
 asyncio.run(main())
 ```
 
+---
+
+### Creating Image Variations
+**Create variations of an existing image:**
+```python
+import asyncio
+from g4f.client import AsyncClient
+from g4f.Provider import OpenaiChat
+
+async def main():
+    client = AsyncClient(image_provider=OpenaiChat)
+    
+    response = await client.images.create_variation(
+        prompt="a white siamese cat",
+        image=open("docs/images/cat.jpg", "rb"),
+        model="dall-e-3",
+        # Add any other necessary parameters
+    )
+    
+    image_url = response.data[0].url
+    print(f"Generated image URL: {image_url}")
+
+asyncio.run(main())
+```
+
+---
+
+### Video Generation
+
+The G4F `AsyncClient` also supports **video generation** through supported providers like `HuggingFaceMedia`. You can retrieve the list of available video models and generate videos from prompts.
+
+**Example: Generate a video using a prompt**
+
+```python
+import asyncio
+from g4f.client import AsyncClient
+from g4f.Provider import HuggingFaceMedia
+
+async def main():
+    client = AsyncClient(
+        provider=HuggingFaceMedia,
+        api_key="hf_***"  # Your API key here
+    )
+
+    # Get available video models
+    video_models = client.models.get_video()
+    print("Available Video Models:", video_models)
+
+    # Generate video
+    result = await client.media.generate(
+        model=video_models[0],
+        prompt="G4F AI technology is the best in the world.",
+        response_format="url"
+    )
+
+    print("Generated Video URL:", result.data[0].url)
+
+asyncio.run(main())
+```
+
+#### Explanation
+- **Client Initialization**: An `AsyncClient` is initialized using the `HuggingFaceMedia` provider with an API key.
+- **Model Discovery**: `client.models.get_video()` fetches a list of supported video models.
+- **Video Generation**: A prompt is submitted to generate a video using `await client.media.generate(...)`.
+- **Output**: The result includes a URL to the generated video, accessed via `result.data[0].url`.
+
+> Make sure your selected provider supports media generation and your API key has appropriate permissions.
+
+## Advanced Usage
+
+### Conversation Memory
+To maintain a coherent conversation, it's important to store the context or history of the dialogue. This can be achieved by appending both the user's inputs and the bot's responses to a messages list. This allows the model to reference past exchanges when generating responses.
+
+**The following example demonstrates how to implement conversation memory with the G4F:**
+```python
+import asyncio
+from g4f.client import AsyncClient
+
+class Conversation:
+    def __init__(self):
+        self.client = AsyncClient()
+        self.history = [
+            {
+                "role": "system",
+                "content": "You are a helpful assistant."
+            }
+        ]
+    
+    def add_message(self, role, content):
+        self.history.append({
+            "role": role,
+            "content": content
+        })
+    
+    async def get_response(self, user_message):
+        # Add user message to history
+        self.add_message("user", user_message)
+        
+        # Get response from AI
+        response = await self.client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=self.history,
+            web_search=False
+        )
+        
+        # Add AI response to history
+        assistant_response = response.choices[0].message.content
+        self.add_message("assistant", assistant_response)
+        
+        return assistant_response
+
+async def main():
+    conversation = Conversation()
+    
+    print("=" * 50)
+    print("G4F Chat started (type 'exit' to end)".center(50))
+    print("=" * 50)
+    print("\nAI: Hello! How can I assist you today?")
+    
+    while True:
+        user_input = input("\nYou: ")
+        
+        if user_input.lower() == 'exit':
+            print("\nGoodbye!")
+            break
+            
+        response = await conversation.get_response(user_input)
+        print("\nAI:", response)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+---
+
+## Search Tool Support
+
+The **Search Tool Support** feature enables triggering a web search during chat completions. This is useful for retrieving real-time or specific data, offering a more flexible solution than `web_search`.
+
+**Example Usage:**
+```python
+import asyncio
+from g4f.client import AsyncClient
+
+async def main():
+    client = AsyncClient()
+
+    tool_calls = [
+        {
+            "function": {
+                "arguments": {
+                    "query": "Latest advancements in AI",
+                    "max_results": 5,
+                    "max_words": 2500,
+                    "backend": "auto",
+                    "add_text": True,
+                    "timeout": 5
+                },
+                "name": "search_tool"
+            },
+            "type": "function"
+        }
+    ]
+
+    response = await client.chat.completions.create(
+        model="gpt-4",
+        messages=[
+            {
+                "role": "user",
+                "content": "Tell me about recent advancements in AI."
+            }
+        ],
+        tool_calls=tool_calls
+    )
+
+    print(response.choices[0].message.content)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+**Parameters for `search_tool`:**
+- **`query`**: The search query string.
+- **`max_results`**: Number of search results to retrieve.
+- **`max_words`**: Maximum number of words in the response.
+- **`backend`**: The backend used for search (e.g., `"api"`).
+- **`add_text`**: Whether to include text snippets in the response.
+- **`timeout`**: Maximum time (in seconds) for the search operation.
+
+**Advantages of Search Tool Support:**
+- Works with any provider, irrespective of `web_search` support.
+- Offers more customization and control over the search process.
+- Bypasses provider-specific limitations.
+
+---
+
+### Using a List of Providers with RetryProvider
+```python
+import asyncio
+from g4f.client import AsyncClient
+
+import g4f.debug
+g4f.debug.logging = True
+g4f.debug.version_check = False
+
+from g4f.Provider import RetryProvider, Phind, FreeChatgpt, Liaobots
+
+async def main():
+    client = AsyncClient(provider=RetryProvider([Phind, FreeChatgpt, Liaobots], shuffle=False)
+    
+    response = await client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "user",
+                "content": "Hello"
+            }
+        ],
+        web_search = False
+    )
+    
+    print(response.choices[0].message.content)
+
+asyncio.run(main())
+```
+
+---
+
 ### Concurrent Tasks with asyncio.gather
 **Execute multiple tasks concurrently:**
 ```python
@@ -284,9 +569,10 @@ asyncio.run(main())
 ```
 
 ## Available Models and Providers
-The G4F AsyncClient supports a wide range of AI models and providers, allowing you to choose the best option for your specific use case. **Here's a brief overview of the available models and providers:**
+The G4F AsyncClient supports a wide range of AI models and providers, allowing you to choose the best option for your specific use case. 
 
-### Models
+**Here's a brief overview of the available models and providers:**
+**Models**
    - GPT-3.5-Turbo
    - GPT-4o-Mini
    - GPT-4
@@ -295,7 +581,7 @@ The G4F AsyncClient supports a wide range of AI models and providers, allowing y
    - Claude (Anthropic)
    - And more...
 
-### Providers
+**Providers**
    - OpenAI
    - Google (for Gemini)
    - Anthropic
@@ -321,7 +607,9 @@ response = await client.chat.completions.create(
 ```
 
 ## Error Handling and Best Practices
-Implementing proper error handling and following best practices is crucial when working with the G4F AsyncClient API. This ensures your application remains robust and can gracefully handle various scenarios. **Here are some key practices to follow:**
+Implementing proper error handling and following best practices is crucial when working with the G4F AsyncClient API. This ensures your application remains robust and can gracefully handle various scenarios. 
+
+**Here are some key practices to follow:**
 
 1. **Use try-except blocks to catch and handle exceptions:**
 ```python

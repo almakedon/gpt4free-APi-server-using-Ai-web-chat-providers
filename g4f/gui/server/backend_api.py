@@ -6,22 +6,28 @@ import os
 import logging
 import asyncio
 import shutil
-from flask import Flask, Response, request, jsonify
+import random
+import datetime
+import tempfile
+from flask import Flask, Response, redirect, request, jsonify, render_template, send_from_directory
+from werkzeug.exceptions import NotFound
 from typing import Generator
 from pathlib import Path
 from urllib.parse import quote_plus
 from hashlib import sha256
-from werkzeug.utils import secure_filename
 
-from ...image import is_allowed_extension, to_image
 from ...client.service import convert_to_provider
 from ...providers.asyncio import to_sync_generator
+from ...providers.response import FinishReason
 from ...client.helper import filter_markdown
 from ...tools.files import supports_filename, get_streaming, get_bucket_dir, get_buckets
 from ...tools.run_tools import iter_run_tools
 from ...errors import ProviderNotFoundError
+from ...image import is_allowed_extension
 from ...cookies import get_cookies_dir
+from ...image.copy_images import secure_filename, get_source_url, images_dir
 from ... import ChatCompletion
+from ... import models
 from .api import Api
 
 logger = logging.getLogger(__name__)
@@ -52,55 +58,163 @@ class Backend_Api(Api):
             app (Flask): Flask application instance to attach routes to.
         """
         self.app: Flask = app
+        self.chat_cache = {}
 
+        if app.demo:
+            @app.route('/', methods=['GET'])
+            def home():
+                client_id = os.environ.get("OAUTH_CLIENT_ID", "ed074164-4f8d-4fb2-8bec-44952707965e")
+                backend_url = os.environ.get("G4F_BACKEND_URL", "")
+                return render_template('demo.html', backend_url=backend_url, client_id=client_id)
+        else:
+            @app.route('/', methods=['GET'])
+            def home():
+                return render_template('home.html')
+
+        @app.route('/qrcode', methods=['GET'])
+        @app.route('/qrcode/<conversation_id>', methods=['GET'])
+        def qrcode(conversation_id: str = ""):
+            share_url = os.environ.get("G4F_SHARE_URL", "")
+            return render_template('qrcode.html', conversation_id=conversation_id, share_url=share_url)
+
+        @app.route('/backend-api/v2/models', methods=['GET'])
         def jsonify_models(**kwargs):
-            response = self.get_models(**kwargs)
-            if isinstance(response, list):
-                return jsonify(response)
-            return response
+            response = get_demo_models() if app.demo else self.get_models(**kwargs)
+            return jsonify(response)
 
+        @app.route('/backend-api/v2/models/<provider>', methods=['GET'])
         def jsonify_provider_models(**kwargs):
             response = self.get_provider_models(**kwargs)
-            if isinstance(response, list):
-                return jsonify(response)
-            return response
+            return jsonify(response)
 
+        @app.route('/backend-api/v2/providers', methods=['GET'])
         def jsonify_providers(**kwargs):
             response = self.get_providers(**kwargs)
             if isinstance(response, list):
                 return jsonify(response)
             return response
 
+        def get_demo_models():
+            return [{
+                "name": model.name,
+                "image": isinstance(model, models.ImageModel),
+                "vision": isinstance(model, models.VisionModel),
+                "audio": isinstance(model, models.AudioModel),
+                "video": isinstance(model, models.VideoModel),
+                "providers": [
+                    getattr(provider, "parent", provider.__name__)
+                    for provider in providers
+                ],
+                "demo": True
+            }
+            for model, providers in models.demo_models.values()]
+
+        def handle_conversation():
+            """
+            Handles conversation requests and streams responses back.
+
+            Returns:
+                Response: A Flask response object for streaming.
+            """
+            if "json" in request.form:
+                json_data = json.loads(request.form['json'])
+            else:
+                json_data = request.json
+            if "files" in request.files:
+                media = []
+                for file in request.files.getlist('files'):
+                    if file.filename != '' and is_allowed_extension(file.filename):
+                        newfile = tempfile.TemporaryFile()
+                        shutil.copyfileobj(file.stream, newfile)
+                        media.append((newfile, file.filename))
+                json_data['media'] = media
+
+            if app.demo and not json_data.get("provider"):
+                model = json_data.get("model")
+                if model != "default" and model in models.demo_models:
+                    json_data["provider"] = random.choice(models.demo_models[model][1])
+                else:
+                    json_data["provider"] = models.HuggingFace
+            kwargs = self._prepare_conversation_kwargs(json_data)
+            return self.app.response_class(
+                self._create_response_stream(
+                    kwargs,
+                    json_data.get("conversation_id"),
+                    json_data.get("provider"),
+                    json_data.get("download_media", True),
+                ),
+                mimetype='text/event-stream'
+            )
+
+        @app.route('/backend-api/v2/conversation', methods=['POST'])
+        def _handle_conversation():
+            return handle_conversation()
+
+        @app.route('/backend-api/v2/usage', methods=['POST'])
+        def add_usage():
+            cache_dir = Path(get_cookies_dir()) / ".usage"
+            cache_file = cache_dir / f"{datetime.date.today()}.jsonl"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            with cache_file.open("a" if cache_file.exists() else "w") as f:
+                f.write(f"{json.dumps(request.json)}\n")
+            return {}
+
+        @app.route('/backend-api/v2/log', methods=['POST'])
+        def add_log():
+            cache_dir = Path(get_cookies_dir()) / ".logging"
+            cache_file = cache_dir / f"{datetime.date.today()}.jsonl"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            data = {"origin": request.headers.get("origin"), **request.json}
+            with cache_file.open("a" if cache_file.exists() else "w") as f:
+                f.write(f"{json.dumps(data)}\n")
+            return {}
+
+        @app.route('/backend-api/v2/memory/<user_id>', methods=['POST'])
+        def add_memory(user_id: str):
+            api_key = request.headers.get("x_api_key")
+            json_data = request.json
+            from mem0 import MemoryClient
+            client = MemoryClient(api_key=api_key)
+            client.add(
+                [{"role": item["role"], "content": item["content"]} for item in json_data.get("items")],
+                user_id=user_id,
+                metadata={"conversation_id": json_data.get("id")}
+            )
+            return {"count": len(json_data.get("items"))}
+
+        @app.route('/backend-api/v2/memory/<user_id>', methods=['GET'])
+        def read_memory(user_id: str):
+            api_key = request.headers.get("x_api_key")
+            from mem0 import MemoryClient
+            client = MemoryClient(api_key=api_key)
+            if request.args.get("search"):
+                return client.search(
+                    request.args.get("search"),
+                    user_id=user_id,
+                    filters=json.loads(request.args.get("filters", "null")),
+                    metadata=json.loads(request.args.get("metadata", "null"))
+                )
+            return client.get_all(
+                user_id=user_id,
+                page=request.args.get("page", 1),
+                page_size=request.args.get("page_size", 100),
+                filters=json.loads(request.args.get("filters", "null")),
+            )
+
         self.routes = {
-            '/backend-api/v2/models': {
-                'function': jsonify_models,
-                'methods': ['GET']
-            },
-            '/backend-api/v2/models/<provider>': {
-                'function': jsonify_provider_models,
-                'methods': ['GET']
-            },
-            '/backend-api/v2/providers': {
-                'function': jsonify_providers,
-                'methods': ['GET']
-            },
             '/backend-api/v2/version': {
                 'function': self.get_version,
                 'methods': ['GET']
-            },
-            '/backend-api/v2/conversation': {
-                'function': self.handle_conversation,
-                'methods': ['POST']
             },
             '/backend-api/v2/synthesize/<provider>': {
                 'function': self.handle_synthesize,
                 'methods': ['GET']
             },
-            '/backend-api/v2/upload_cookies': {
-                'function': self.upload_cookies,
-                'methods': ['POST']
-            },
             '/images/<path:name>': {
+                'function': self.serve_images,
+                'methods': ['GET']
+            },
+            '/media/<path:name>': {
                 'function': self.serve_images,
                 'methods': ['GET']
             }
@@ -120,7 +234,7 @@ class Backend_Api(Api):
                     tool_calls.append({
                         "function": {
                             "name": "search_tool",
-                            "arguments": {"query": web_search, "instructions": ""} if web_search != "true" else {}
+                            "arguments": {"query": web_search, "instructions": "", "max_words": 1000} if web_search != "true" else {}
                         },
                         "type": "function"
                     })
@@ -144,36 +258,31 @@ class Backend_Api(Api):
                     else:
                         response = iter_run_tools(ChatCompletion.create, **parameters)
                         cache_dir.mkdir(parents=True, exist_ok=True)
+                        copy_response = [chunk for chunk in response]
                         with cache_file.open("w") as f:
-                            f.write(response)
+                            for chunk in copy_response:
+                                f.write(str(chunk))
+                        response = copy_response
                 else:
                     response = iter_run_tools(ChatCompletion.create, **parameters)
 
                 if do_filter_markdown:
-                    return Response(filter_markdown(response, do_filter_markdown), mimetype='text/plain')
+                    return Response(filter_markdown("".join([str(chunk) for chunk in response]), do_filter_markdown), mimetype='text/plain')
                 def cast_str():
                     for chunk in response:
-                        yield str(chunk)
+                        if isinstance(chunk, FinishReason):
+                            yield f"[{chunk.reason}]" if chunk.reason != "stop" else ""
+                        elif not isinstance(chunk, Exception):
+                            yield str(chunk)
                 return Response(cast_str(), mimetype='text/plain')
             except Exception as e:
                 logger.exception(e)
                 return jsonify({"error": {"message": f"{type(e).__name__}: {e}"}}), 500
 
-        @app.route('/backend-api/v2/buckets', methods=['GET'])
-        def list_buckets():
-            try:
-                buckets = get_buckets()
-                if buckets is None:
-                    return jsonify({"error": {"message": "Error accessing bucket directory"}}), 500
-                sanitized_buckets = [secure_filename(b) for b in buckets]
-                return jsonify(sanitized_buckets), 200
-            except Exception as e:
-                return jsonify({"error": {"message": str(e)}}), 500
-
         @app.route('/backend-api/v2/files/<bucket_id>', methods=['GET', 'DELETE'])
         def manage_files(bucket_id: str):
             bucket_id = secure_filename(bucket_id)
-            bucket_dir = get_bucket_dir(secure_filename(bucket_id))
+            bucket_dir = get_bucket_dir(bucket_id)
 
             if not os.path.isdir(bucket_dir):
                 return jsonify({"error": {"message": "Bucket directory not found"}}), 404
@@ -197,90 +306,115 @@ class Backend_Api(Api):
         def upload_files(bucket_id: str):
             bucket_id = secure_filename(bucket_id)
             bucket_dir = get_bucket_dir(bucket_id)
+            media_dir = os.path.join(bucket_dir, "media")
             os.makedirs(bucket_dir, exist_ok=True)
             filenames = []
-            for file in request.files.getlist('files[]'):
+            media = []
+            for file in request.files.getlist('files'):
                 try:
                     filename = secure_filename(file.filename)
-                    if supports_filename(filename):
-                        with open(os.path.join(bucket_dir, filename), 'wb') as f:
-                            shutil.copyfileobj(file.stream, f)
+                    if is_allowed_extension(filename):
+                        os.makedirs(media_dir, exist_ok=True)
+                        newfile = os.path.join(media_dir, filename)
+                        media.append(filename)
+                    elif supports_filename(filename):
+                        newfile = os.path.join(bucket_dir, filename)
                         filenames.append(filename)
+                    else:
+                        continue
+                    with open(newfile, 'wb') as f:
+                        shutil.copyfileobj(file.stream, f)
                 finally:
                     file.stream.close()
             with open(os.path.join(bucket_dir, "files.txt"), 'w') as f:
                 [f.write(f"{filename}\n") for filename in filenames]
-            return {"bucket_id": bucket_id, "files": filenames}
+            return {"bucket_id": bucket_id, "files": filenames, "media": media}
 
-        @app.route('/backend-api/v2/files/<bucket_id>/<filename>', methods=['PUT'])
-        def upload_file(bucket_id, filename):
-            bucket_id = secure_filename(bucket_id)
-            bucket_dir = get_bucket_dir(bucket_id)
-            filename = secure_filename(filename)
-            bucket_path = Path(bucket_dir)
-
-            if not supports_filename(filename):
-                return jsonify({"error": {"message": f"File type not allowed"}}), 400
-
-            if not bucket_path.exists():
-                bucket_path.mkdir(parents=True, exist_ok=True)
-
+        @app.route('/files/<bucket_id>/media/<filename>', methods=['GET'])
+        def get_media(bucket_id, filename, dirname: str = None):
+            media_dir = get_bucket_dir(dirname, bucket_id, "media")
             try:
-                file_path = bucket_path / filename
-                file_data = request.get_data()
-                if not file_data:
-                    return jsonify({"error": {"message": "No file data received"}}), 400
+                return send_from_directory(os.path.abspath(media_dir), filename)
+            except NotFound:
+                source_url = get_source_url(request.query_string.decode())
+                if source_url is not None:
+                    return redirect(source_url)
+                raise
 
-                with open(str(file_path), 'wb') as f:
-                    f.write(file_data)
+        self.match_files = {}
 
-                return jsonify({"message": f"File '{filename}' uploaded successfully to bucket '{bucket_id}'"}), 201
-            except Exception as e:
-                return jsonify({"error": {"message": f"Error uploading file: {str(e)}"}}), 500
+        @app.route('/search/<search>', methods=['GET'])
+        def find_media(search: str):
+            safe_search = [secure_filename(chunk.lower()) for chunk in search.split("+")]
+            if not os.access(images_dir, os.R_OK):
+                return jsonify({"error": {"message": "Not found"}}), 404
+            if search not in self.match_files:
+                self.match_files[search] = {}
+                for root, _, files in os.walk(images_dir):
+                    for file in files:
+                        mime_type = is_allowed_extension(file)
+                        if mime_type is not None:
+                            mime_type = secure_filename(mime_type)
+                            for tag in safe_search:
+                                if tag in mime_type:
+                                    self.match_files[search][file] = self.match_files[search].get(file, 0) + 1
+                                    break
+                        for tag in safe_search:
+                            if tag in file.lower():
+                                self.match_files[search][file] = self.match_files[search].get(file, 0) + 1
+                    break
+            match_files = [file for file, count in self.match_files[search].items() if count >= request.args.get("min", len(safe_search))]
+            if int(request.args.get("skip", 0)) >= len(match_files):
+                return jsonify({"error": {"message": "Not found"}}), 404
+            if (request.args.get("random", False)):
+                seed = request.args.get("random")
+                if seed not in ["true", "True", "1"]:
+                   random.seed(seed)
+                return redirect(f"/media/{random.choice(match_files)}"), 302
+            return redirect(f"/media/{match_files[int(request.args.get('skip', 0))]}", 302)
 
-    def upload_cookies(self):
-        file = None
-        if "file" in request.files:
-            file = request.files['file']
-            if file.filename == '':
-                return 'No selected file', 400
-        if file and file.filename.endswith(".json") or file.filename.endswith(".har"):
-            filename = secure_filename(file.filename)
-            file.save(os.path.join(get_cookies_dir(), filename))
-            return "File saved", 200
-        return 'Not supported file', 400
+        @app.route('/backend-api/v2/upload_cookies', methods=['POST'])
+        def upload_cookies():
+            file = None
+            if "file" in request.files:
+                file = request.files['file']
+                if file.filename == '':
+                    return 'No selected file', 400
+            if file and file.filename.endswith(".json") or file.filename.endswith(".har"):
+                filename = secure_filename(file.filename)
+                file.save(os.path.join(get_cookies_dir(), filename))
+                return "File saved", 200
+            return 'Not supported file', 400
 
-    def handle_conversation(self):
-        """
-        Handles conversation requests and streams responses back.
+        @self.app.route('/backend-api/v2/chat/<share_id>', methods=['GET'])
+        def get_chat(share_id: str) -> str:
+            share_id = secure_filename(share_id)
+            if self.chat_cache.get(share_id, 0) == int(request.headers.get("if-none-match", 0)):
+                return jsonify({"error": {"message": "Not modified"}}), 304
+            file = get_bucket_dir(share_id, "chat.json")
+            if not os.path.isfile(file):
+                return jsonify({"error": {"message": "Not found"}}), 404
+            with open(file, 'r') as f:
+                chat_data = json.load(f)
+                if chat_data.get("updated", 0) == int(request.headers.get("if-none-match", 0)):
+                    return jsonify({"error": {"message": "Not modified"}}), 304
+                self.chat_cache[share_id] = chat_data.get("updated", 0)
+                return jsonify(chat_data), 200
 
-        Returns:
-            Response: A Flask response object for streaming.
-        """
-        
-        kwargs = {}
-        if "files[]" in request.files:
-            images = []
-            for file in request.files.getlist('files[]'):
-                if file.filename != '' and is_allowed_extension(file.filename):
-                    images.append((to_image(file.stream, file.filename.endswith('.svg')), file.filename))
-            kwargs['images'] = images
-        if "json" in request.form:
-            json_data = json.loads(request.form['json'])
-        else:
-            json_data = request.json
-
-        kwargs = self._prepare_conversation_kwargs(json_data, kwargs)
-
-        return self.app.response_class(
-            self._create_response_stream(
-                kwargs,
-                json_data.get("conversation_id"),
-                json_data.get("provider"),
-                json_data.get("download_images", True),
-            ),
-            mimetype='text/event-stream'
-        )
+        @self.app.route('/backend-api/v2/chat/<share_id>', methods=['POST'])
+        def upload_chat(share_id: str) -> dict:
+            chat_data = {**request.json}
+            updated = chat_data.get("updated", 0)
+            cache_value = self.chat_cache.get(share_id, 0)
+            if updated == cache_value:
+                return jsonify({"error": {"message": "invalid date"}}), 400
+            share_id = secure_filename(share_id)
+            bucket_dir = get_bucket_dir(share_id)
+            os.makedirs(bucket_dir, exist_ok=True)
+            with open(os.path.join(bucket_dir, "chat.json"), 'w') as f:
+                json.dump(chat_data, f)
+            self.chat_cache[share_id] = updated
+            return {"share_id": share_id}
 
     def handle_synthesize(self, provider: str):
         try:
@@ -303,12 +437,14 @@ class Backend_Api(Api):
 
     def get_provider_models(self, provider: str):
         api_key = request.headers.get("x_api_key")
-        models = super().get_provider_models(provider, api_key)
+        api_base = request.headers.get("x_api_base")
+        ignored = request.headers.get("x_ignored").split()
+        models = super().get_provider_models(provider, api_key, api_base, ignored)
         if models is None:
             return "Provider not found", 404
         return models
 
-    def _format_json(self, response_type: str, content) -> str:
+    def _format_json(self, response_type: str, content = None, **kwargs) -> str:
         """
         Formats and returns a JSON response.
 
@@ -319,4 +455,4 @@ class Backend_Api(Api):
         Returns:
             str: A JSON formatted string.
         """
-        return json.dumps(super()._format_json(response_type, content)) + "\n"
+        return json.dumps(super()._format_json(response_type, content, **kwargs)) + "\n"

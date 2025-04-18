@@ -41,11 +41,10 @@ async def async_generator_to_list(generator: AsyncIterator) -> list:
     return [item async for item in generator]
 
 def to_sync_generator(generator: AsyncIterator, stream: bool = True) -> Iterator:
+    loop = get_running_loop(check_nested=False)
     if not stream:
         yield from asyncio.run(async_generator_to_list(generator))
         return
-
-    loop = get_running_loop(check_nested=False)
     new_loop = False
     if loop is None:
         loop = asyncio.new_event_loop()
@@ -69,16 +68,12 @@ def to_sync_generator(generator: AsyncIterator, stream: bool = True) -> Iterator
                 loop.close()
 
 # Helper function to convert a synchronous iterator to an async iterator
-async def to_async_iterator(iterator: Iterator) -> AsyncIterator:
-    if isinstance(iterator, str):
-        yield iterator
-    elif hasattr(iterator, "__await__"):
-        yield await iterator
-    elif hasattr(iterator, "__aiter__"):
+async def to_async_iterator(iterator) -> AsyncIterator:
+    if hasattr(iterator, '__aiter__'):
         async for item in iterator:
             yield item
-    elif hasattr(iterator, "__iter__"):
+    elif asyncio.iscoroutine(iterator):
+        yield await iterator
+    else:
         for item in iterator:
             yield item
-    else:
-        yield iterator

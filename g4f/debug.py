@@ -1,13 +1,18 @@
-from .providers.types import ProviderType
+import sys
+from typing import Callable, List, Optional, Any
 
 logging: bool = False
 version_check: bool = True
-last_provider: ProviderType = None
-last_model: str = None
-version: str = None
-log_handler: callable = print
-logs: list = []
+version: Optional[str] = None
+log_handler: Callable = print  # More specifically: Callable[[Any, Optional[Any]], None]
+logs: List[str] = []
 
-def log(text):
+def log(*text: Any, file: Optional[Any] = None) -> None:
+    """Log a message if logging is enabled."""
     if logging:
-        log_handler(text)
+        log_handler(*text, file=file)
+
+def error(*error: Any, name: Optional[str] = None) -> None:
+    """Log an error message to stderr."""
+    error = [e if isinstance(e, str) else f"{type(e).__name__ if name is None else name}: {e}" for e in error]
+    log(*error, file=sys.stderr)

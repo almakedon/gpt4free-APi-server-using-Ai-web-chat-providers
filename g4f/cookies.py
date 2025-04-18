@@ -56,6 +56,7 @@ DOMAINS = [
     ".google.com",
     "www.whiterabbitneo.com",
     "huggingface.co",
+    ".huggingface.co"
     "chat.reka.ai",
     "chatgpt.com",
     ".cerebras.ai",
@@ -65,7 +66,7 @@ DOMAINS = [
 if has_browser_cookie3 and os.environ.get('DBUS_SESSION_BUS_ADDRESS') == "/dev/null":
     _LinuxPasswordManager.get_password = lambda a, b: b"secret"
 
-def get_cookies(domain_name: str = '', raise_requirements_error: bool = True, single_browser: bool = False) -> Dict[str, str]:
+def get_cookies(domain_name: str, raise_requirements_error: bool = True, single_browser: bool = False, cache_result: bool = True) -> Dict[str, str]:
     """
     Load cookies for a given domain from all supported browsers and cache the results.
 
@@ -79,7 +80,8 @@ def get_cookies(domain_name: str = '', raise_requirements_error: bool = True, si
         return CookiesConfig.cookies[domain_name]
 
     cookies = load_cookies_from_browsers(domain_name, raise_requirements_error, single_browser)
-    CookiesConfig.cookies[domain_name] = cookies
+    if cache_result:
+        CookiesConfig.cookies[domain_name] = cookies
     return cookies
 
 def set_cookies(domain_name: str, cookies: Cookies = None) -> None:
@@ -106,8 +108,8 @@ def load_cookies_from_browsers(domain_name: str, raise_requirements_error: bool 
     for cookie_fn in browsers:
         try:
             cookie_jar = cookie_fn(domain_name=domain_name)
-            if len(cookie_jar) and debug.logging:
-                print(f"Read cookies from {cookie_fn.__name__} for {domain_name}")
+            if len(cookie_jar):
+                debug.log(f"Read cookies from {cookie_fn.__name__} for {domain_name}")
             for cookie in cookie_jar:
                 if cookie.name not in cookies:
                     if not cookie.expires or cookie.expires > time.time():
@@ -117,8 +119,7 @@ def load_cookies_from_browsers(domain_name: str, raise_requirements_error: bool 
         except BrowserCookieError:
             pass
         except Exception as e:
-            if debug.logging:
-                print(f"Error reading cookies from {cookie_fn.__name__} for {domain_name}: {e}")
+            debug.error(f"Error reading cookies from {cookie_fn.__name__} for {domain_name}: {e}")
     return cookies
 
 def set_cookies_dir(dir: str) -> None:
@@ -150,6 +151,7 @@ def read_cookie_files(dirPath: str = None):
                 harFiles.append(os.path.join(root, file))
             elif file.endswith(".json"):
                 cookieFiles.append(os.path.join(root, file))
+        break
 
     CookiesConfig.cookies = {}
     for path in harFiles:
@@ -190,5 +192,5 @@ def read_cookie_files(dirPath: str = None):
                         new_cookies[c["domain"]] = {}
                     new_cookies[c["domain"]][c["name"]] = c["value"]
             for domain, new_values in new_cookies.items():
-                debug.log(f"Cookies added: {len(new_values)} from {domain}")
                 CookiesConfig.cookies[domain] = new_values
+                debug.log(f"Cookies added: {len(new_values)} from {domain}")

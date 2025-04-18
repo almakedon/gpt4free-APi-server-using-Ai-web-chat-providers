@@ -34,7 +34,10 @@ class NestAsyncioError(MissingRequirementsError):
 class MissingAuthError(Exception):
     ...
 
-class NoImageResponseError(Exception):
+class PaymentRequiredError(Exception):
+    ...
+
+class NoMediaResponseError(Exception):
     ...
 
 class ResponseError(Exception):
@@ -48,3 +51,9 @@ class RateLimitError(ResponseStatusError):
 
 class NoValidHarFileError(Exception):
     ...
+
+class TimeoutError(Exception):
+    """Raised for timeout errors during API requests."""
+
+class ConversationLimitError(Exception):
+    """Raised for conversation limit during API requests to AI endpoint."""

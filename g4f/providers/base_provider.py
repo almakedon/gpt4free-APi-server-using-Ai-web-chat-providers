@@ -18,21 +18,23 @@ from ..typing import CreateResult, AsyncResult, Messages
 from .types import BaseProvider
 from .asyncio import get_running_loop, to_sync_generator, to_async_iterator
 from .response import BaseConversation, AuthResult
-from .helper import concat_chunks, async_concat_chunks
+from .helper import concat_chunks
 from ..cookies import get_cookies_dir
-from ..errors import ModelNotSupportedError, ResponseError, MissingAuthError, NoValidHarFileError
+from ..errors import ModelNotSupportedError, ResponseError, MissingAuthError, NoValidHarFileError, PaymentRequiredError
 from .. import debug
 
 SAFE_PARAMETERS = [
     "model", "messages", "stream", "timeout",
-    "proxy", "images", "response_format",
-    "prompt", "tools", "conversation",
-    "history_disabled", "auto_continue",
+    "proxy", "media", "response_format",
+    "prompt", "negative_prompt", "tools", "conversation",
+    "history_disabled",
     "temperature",  "top_k", "top_p",
     "frequency_penalty", "presence_penalty",
-    "max_tokens", "max_new_tokens", "stop",
+    "max_tokens", "stop",
     "api_key", "api_base", "seed", "width", "height",
-    "proof_token", "max_retries"
+    "max_retries", "web_search",
+    "guidance_scale", "num_inference_steps", "randomize_seed",
+    "safe", "enhance", "private", "aspect_ratio", "n",
 ]
 
 BASIC_PARAMETERS = {
@@ -42,8 +44,8 @@ BASIC_PARAMETERS = {
     "stream": False,
     "timeout": 0,
     "response_format": None,
-    "max_tokens": None,
-    "stop": None,
+    "max_tokens": 4096,
+    "stop": ["stop1", "stop2"],
 }
 
 PARAMETER_EXAMPLES = {
@@ -54,12 +56,11 @@ PARAMETER_EXAMPLES = {
     "frequency_penalty": 1,
     "presence_penalty": 1,
     "messages": [{"role": "system", "content": ""}, {"role": "user", "content": ""}],
-    "images": [["data:image/jpeg;base64,...", "filename.jpg"]],
+    "media": [["data:image/jpeg;base64,...", "filename.jpg"]],
     "response_format": {"type": "json_object"},
     "conversation": {"conversation_id": "550e8400-e29b-11d4-a716-...", "message_id": "550e8400-e29b-11d4-a716-..."},
-    "max_new_tokens": 1024,
-    "max_tokens": 4096,
     "seed": 42,
+    "tools": [],
 }
 
 class AbstractProvider(BaseProvider):
@@ -339,7 +340,10 @@ class ProviderModelMixin:
     default_model: str = None
     models: list[str] = []
     model_aliases: dict[str, str] = {}
-    image_models: list = None
+    image_models: list = []
+    vision_models: list = []
+    video_models: list = []
+    audio_models: dict = {}
     last_model: str = None
 
     @classmethod
@@ -356,7 +360,7 @@ class ProviderModelMixin:
             model = cls.model_aliases[model]
         else:
             if model not in cls.get_models(**kwargs) and cls.models:
-                raise ModelNotSupportedError(f"Model is not supported: {model} in: {cls.__name__}")
+                raise ModelNotSupportedError(f"Model is not supported: {model} in: {cls.__name__} Valid models: {cls.models}")
         cls.last_model = model
         debug.last_model = model
         return model
@@ -364,18 +368,38 @@ class ProviderModelMixin:
 class RaiseErrorMixin():
 
     @staticmethod
-    def raise_error(data: dict):
+    def raise_error(data: dict, status: int = None):
         if "error_message" in data:
             raise ResponseError(data["error_message"])
         elif "error" in data:
-            if "code" in data["error"]:
-                raise ResponseError(f'Error {data["error"]["code"]}: {data["error"]["message"]}')
+            if isinstance(data["error"], str):
+                if status is not None:
+                    if status == 401:
+                        raise MissingAuthError(f"Error {status}: {data['error']}")
+                    elif status == 402:
+                        raise PaymentRequiredError(f"Error {status}: {data['error']}")
+                    raise ResponseError(f"Error {status}: {data['error']}")
+                raise ResponseError(data["error"])
+            elif isinstance(data["error"], bool):
+                raise ResponseError(data)
+            elif "code" in data["error"]:
+                raise ResponseError("\n".join(
+                    [e for e in [f'Error {data["error"]["code"]}: {data["error"]["message"]}', data["error"].get("failed_generation")] if e is not None]
+                ))
             elif "message" in data["error"]:
                 raise ResponseError(data["error"]["message"])
             else:
                 raise ResponseError(data["error"])
+        elif ("choices" not in data or not data["choices"]) and "data" not in data:
+            raise ResponseError(f"Invalid response: {json.dumps(data)}")
 
-class AsyncAuthedProvider(AsyncGeneratorProvider):
+class AuthFileMixin():
+
+    @classmethod
+    def get_cache_file(cls) -> Path:
+        return Path(get_cookies_dir()) / f"auth_{cls.parent if hasattr(cls, 'parent') else cls.__name__}.json"
+
+class AsyncAuthedProvider(AsyncGeneratorProvider, AuthFileMixin):
 
     @classmethod
     async def on_auth_async(cls, **kwargs) -> AuthResult:
@@ -385,7 +409,10 @@ class AsyncAuthedProvider(AsyncGeneratorProvider):
 
     @classmethod
     def on_auth(cls, **kwargs) -> AuthResult:
-        return asyncio.run(cls.on_auth_async(**kwargs))
+        auth_result = cls.on_auth_async(**kwargs)
+        if hasattr(auth_result, "__aiter__"):
+            return to_sync_generator(auth_result)
+        return asyncio.run(auth_result)
 
     @classmethod
     def get_create_function(cls) -> callable:
@@ -396,8 +423,20 @@ class AsyncAuthedProvider(AsyncGeneratorProvider):
         return cls.create_async_generator
 
     @classmethod
-    def get_cache_file(cls) -> Path:
-        return Path(get_cookies_dir()) / f"auth_{cls.parent if hasattr(cls, 'parent') else cls.__name__}.json"
+    def write_cache_file(cls, cache_file: Path, auth_result: AuthResult = None):
+         if auth_result is not None:
+            cache_file.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                def toJSON(obj):
+                    if hasattr(obj, "get_dict"):
+                        return obj.get_dict()
+                    return str(obj)
+                with cache_file.open("w") as cache_file:
+                    json.dump(auth_result, cache_file, default=toJSON)
+            except TypeError as e:
+                raise RuntimeError(f"Failed to save: {auth_result.get_dict()}\n{type(e).__name__}: {e}")
+         elif cache_file.exists():
+            cache_file.unlink()
 
     @classmethod
     def create_completion(
@@ -405,62 +444,61 @@ class AsyncAuthedProvider(AsyncGeneratorProvider):
         model: str,
         messages: Messages,
         **kwargs
-    ) -> CreateResult:
+) -> CreateResult:
+        auth_result: AuthResult = None
+        cache_file = cls.get_cache_file()
         try:
-            auth_result = AuthResult()
-            cache_file = cls.get_cache_file()
             if cache_file.exists():
                 with cache_file.open("r") as f:
-                    auth_result = AuthResult(**json.load(f))
+                    data = f.read()
+                if data:
+                    auth_result = AuthResult(**json.loads(data))
             else:
-                auth_result = cls.on_auth(**kwargs)
-                if hasattr(auth_result, "_iter__"):
-                    for chunk in auth_result:
-                        if isinstance(chunk, AsyncResult):
-                            auth_result = chunk
-                        else:
-                            yield chunk
+                raise MissingAuthError
             yield from to_sync_generator(cls.create_authed(model, messages, auth_result, **kwargs))
         except (MissingAuthError, NoValidHarFileError):
-            if cache_file.exists():
-                cache_file.unlink()
-            auth_result = cls.on_auth(**kwargs)
+            response = cls.on_auth(**kwargs)
+            for chunk in response:
+                if isinstance(chunk, AuthResult):
+                    auth_result = chunk
+                else:
+                    yield chunk
             yield from to_sync_generator(cls.create_authed(model, messages, auth_result, **kwargs))
         finally:
-                cache_file.parent.mkdir(parents=True, exist_ok=True)
-                cache_file.write_text(json.dumps(auth_result.get_dict()))
+            cls.write_cache_file(cache_file, auth_result)
 
+    @classmethod
     async def create_async_generator(
         cls,
         model: str,
         messages: Messages,
         **kwargs
     ) -> AsyncResult:
+        auth_result: AuthResult = None
+        cache_file = cls.get_cache_file()
         try:
-            auth_result = AuthResult()
-            cache_file = Path(get_cookies_dir()) / f"auth_{cls.parent if hasattr(cls, 'parent') else cls.__name__}.json"
             if cache_file.exists():
                 with cache_file.open("r") as f:
                     auth_result = AuthResult(**json.load(f))
             else:
-                auth_result = await cls.on_auth_async(**kwargs)
-                if hasattr(auth_result, "_aiter__"):
-                    async for chunk in auth_result:
-                        if isinstance(chunk, AsyncResult):
-                            auth_result = chunk
-                        else:
-                            yield chunk
+                raise MissingAuthError
             response = to_async_iterator(cls.create_authed(model, messages, **kwargs, auth_result=auth_result))
             async for chunk in response:
                 yield chunk
         except (MissingAuthError, NoValidHarFileError):
             if cache_file.exists():
                 cache_file.unlink()
-            auth_result = await cls.on_auth_async(**kwargs)
+            response = cls.on_auth_async(**kwargs)
+            async for chunk in response:
+                if isinstance(chunk, AuthResult):
+                    auth_result = chunk
+                else:
+                    yield chunk
             response = to_async_iterator(cls.create_authed(model, messages, **kwargs, auth_result=auth_result))
             async for chunk in response:
+                if cache_file is not None:
+                    cls.write_cache_file(cache_file, auth_result)
+                    cache_file = None
                 yield chunk
         finally:
-            if auth_result is not None:
-                cache_file.parent.mkdir(parents=True, exist_ok=True)
-                cache_file.write_text(json.dumps(auth_result.get_dict()))
+            cls.write_cache_file(cache_file, auth_result)

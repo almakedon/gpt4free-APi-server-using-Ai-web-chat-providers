@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from curl_cffi.requests import AsyncSession, Response
 try:
-    from curl_cffi.requests import CurlMime
+    from curl_cffi import CurlMime
     has_curl_mime = True
 except ImportError:
     has_curl_mime = False
 try:
-    from curl_cffi.requests import CurlWsFlag
+    from curl_cffi import CurlWsFlag
     has_curl_ws = True
 except ImportError:
     has_curl_ws = False
@@ -47,10 +47,24 @@ class StreamResponse:
         """Asynchronously iterate over the response content."""
         return self.inner.aiter_content()
 
+    async def sse(self) -> AsyncGenerator[dict, None]:
+        """Asynchronously iterate over the Server-Sent Events of the response."""
+        async for line in self.iter_lines():
+            if line.startswith(b"data: "):
+                chunk = line[6:]
+                if chunk == b"[DONE]":
+                    break
+                try:
+                    yield json.loads(chunk)
+                except json.JSONDecodeError:
+                    continue
+
     async def __aenter__(self):
         """Asynchronously enter the runtime context for the response object."""
         inner: Response = await self.inner
         self.inner = inner
+        self.url = inner.url
+        self.method = inner.request.method
         self.request = inner.request
         self.status: int = inner.status_code
         self.reason: str = inner.reason
@@ -71,12 +85,12 @@ class StreamSession(AsyncSession):
     """
 
     def request(
-        self, method: str, url: str, **kwargs
+        self, method: str, url: str, ssl = None, **kwargs
     ) -> StreamResponse:
-        if isinstance(kwargs.get("data"), CurlMime):
+        if kwargs.get("data") and isinstance(kwargs.get("data"), CurlMime):
             kwargs["multipart"] = kwargs.pop("data")
         """Create and return a StreamResponse object for the given HTTP request."""
-        return StreamResponse(super().request(method, url, stream=True, **kwargs))
+        return StreamResponse(super().request(method, url, stream=True, verify=ssl, **kwargs))
 
     def ws_connect(self, url, *args, **kwargs):
         return WebSocket(self, url, **kwargs)
@@ -100,12 +114,12 @@ if has_curl_mime:
 else:
     class FormData():
         def __init__(self) -> None:
-            raise RuntimeError("CurlMimi in curl_cffi is missing | pip install -U g4f[curl_cffi]")
+            raise RuntimeError("CurlMimi in curl_cffi is missing | pip install -U curl_cffi")
 
 class WebSocket():
     def __init__(self, session, url, **kwargs) -> None:
         if not has_curl_ws:
-            raise RuntimeError("CurlWsFlag in curl_cffi is missing | pip install -U g4f[curl_cffi]")
+            raise RuntimeError("CurlWsFlag in curl_cffi is missing | pip install -U curl_cffi")
         self.session: StreamSession = session
         self.url: str = url
         del kwargs["autoping"]
@@ -116,11 +130,13 @@ class WebSocket():
         return self
 
     async def __aexit__(self, *args):
-        await self.inner.aclose()
+        await self.inner.aclose() if hasattr(self.inner, "aclose") else await self.inner.close()
 
     async def receive_str(self, **kwargs) -> str:
-        bytes, _ = await self.inner.arecv()
+        method = self.inner.arecv if hasattr(self.inner, "arecv") else self.inner.recv
+        bytes, _ = await method()
         return bytes.decode(errors="ignore")
 
     async def send_str(self, data: str):
-        await self.inner.asend(data.encode(), CurlWsFlag.TEXT)
+        method = self.inner.asend if hasattr(self.inner, "asend") else self.inner.send
+        await method(data.encode(), CurlWsFlag.TEXT)

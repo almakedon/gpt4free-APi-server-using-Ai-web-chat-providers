@@ -33,13 +33,16 @@ class ChatCompletion:
                ignore_working: bool = False,
                ignore_stream: bool = False,
                **kwargs) -> Union[CreateResult, str]:
+        if image is not None:
+            kwargs["media"] = [(image, image_name)]
+        elif "images" in kwargs:
+            kwargs["media"] = kwargs.pop("images")
         model, provider = get_model_and_provider(
             model, provider, stream,
             ignore_working,
-            ignore_stream
+            ignore_stream,
+            has_images="media" in kwargs,
         )
-        if image is not None:
-            kwargs["images"] = [(image, image_name)]
         if "proxy" not in kwargs:
             proxy = os.environ.get("G4F_PROXY")
             if proxy:
@@ -49,7 +52,7 @@ class ChatCompletion:
 
         result = provider.get_create_function()(model, messages, stream=stream, **kwargs)
 
-        return result if stream else concat_chunks(result)
+        return result if stream or ignore_stream else concat_chunks(result)
 
     @staticmethod
     def create_async(model    : Union[Model, str],
@@ -61,9 +64,11 @@ class ChatCompletion:
                      ignore_stream: bool = False,
                      ignore_working: bool = False,
                      **kwargs) -> Union[AsyncResult, Coroutine[str]]:
-        model, provider = get_model_and_provider(model, provider, False, ignore_working)
         if image is not None:
-            kwargs["images"] = [(image, image_name)]
+            kwargs["media"] = [(image, image_name)]
+        elif "images" in kwargs:
+            kwargs["media"] = kwargs.pop("images")
+        model, provider = get_model_and_provider(model, provider, False, ignore_working, has_images="media" in kwargs)
         if "proxy" not in kwargs:
             proxy = os.environ.get("G4F_PROXY")
             if proxy:
@@ -73,7 +78,7 @@ class ChatCompletion:
 
         result = provider.get_async_create_function()(model, messages, stream=stream, **kwargs)
 
-        if not stream:
+        if not stream and not ignore_stream:
             if hasattr(result, "__aiter__"):
                 result = async_concat_chunks(result)
 
